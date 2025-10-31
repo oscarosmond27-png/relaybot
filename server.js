@@ -1,15 +1,22 @@
-// server.js – Twilio <-> OpenAI Realtime relay (Render)
+// server.js – Twilio <-> OpenAI Realtime relay (Render, Node 22)
+// Uses ws client to connect to OpenAI Realtime via WebSocket
+// Endpoints:
+//   GET /           -> "OK" (health/keep-alive)
+//   GET /health     -> "healthy"
+//   GET /twiml?prompt=... -> TwiML that tells Twilio to open a media stream to /twilio
+//   (upgrade) /twilio  -> WS bridge Twilio <-> OpenAI
+
 import express from "express";
-import { WebSocketServer } from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 
 const app = express();
 app.use(express.json());
 
-// Health endpoints (fixes "Cannot GET /")
+// ---- Health ----
 app.get("/", (_req, res) => res.type("text/plain").send("OK"));
 app.get("/health", (_req, res) => res.type("text/plain").send("healthy"));
 
-// TwiML endpoint (Twilio fetches this)
+// ---- TwiML (Twilio fetches this) ----
 app.get("/twiml", (req, res) => {
   try {
     const prompt = req.query.prompt || "";
@@ -31,93 +38,103 @@ app.get("/twiml", (req, res) => {
   }
 });
 
-// Start HTTP server
+// ---- HTTP server ----
 const server = app.listen(process.env.PORT || 10000, () => {
   console.log("Server listening on", server.address().port);
 });
 
-// WS bridge Twilio <-> OpenAI Realtime
+// ---- WS upgrade routing ----
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   if (req.url.startsWith("/twilio")) {
-    wss.handleUpgrade(req, socket, head, (ws) => handleTwilio(ws, req).catch(err => {
-      console.error("handleTwilio error:", err);
-      try { ws.close(); } catch {}
-    }));
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      handleTwilio(ws, req).catch(err => {
+        console.error("handleTwilio error:", err);
+        try { ws.close(); } catch {}
+      });
+    });
   } else {
     socket.destroy();
   }
 });
 
+// ---- Twilio <-> OpenAI bridge ----
 async function handleTwilio(ws, req) {
   const prompt = new URL(req.url, "https://example.com").searchParams.get("prompt") || "";
 
-  // Outbound WS to OpenAI Realtime
-  const resp = await fetch("https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview", {
-    headers: {
-      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1",
-      "Sec-WebSocket-Protocol": "realtime",
-      "Connection": "Upgrade",
-      "Upgrade": "websocket"
+  // Connect to OpenAI Realtime with ws client (Node)
+  const model = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
+  const oai = new WebSocket(
+    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`,
+    "realtime",
+    {
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1"
+      }
     }
-  });
-
-  const oai = resp.webSocket;
-  if (!oai) {
-    console.error("OpenAI WS connect failed, status:", resp.status);
-    ws.close();
-    return;
-  }
-  oai.accept();
-
-  // Configure session
-  oai.send(JSON.stringify({
-    type: "session.update",
-    session: {
-      voice: "alloy",
-      modalities: ["audio"],
-      input_audio_format: "g711_ulaw",
-      output_audio_format: "g711_ulaw",
-      turn_detection: { type: "server_vad" },
-      instructions: "You are a friendly English-speaking phone assistant. Deliver the caller’s message, then keep replies brief."
-    }
-  }));
-
-  // Initial prompt
-  oai.send(JSON.stringify({
-    type: "response.create",
-    response: { instructions: `Deliver this message: ${prompt}`, modalities: ["audio"] }
-  }));
+  );
 
   let streamSid = null;
+  let oaiOpen = false;
 
-  // Twilio → OpenAI
+  oai.on("open", () => {
+    oaiOpen = true;
+
+    // Configure session
+    oai.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        voice: "alloy",
+        modalities: ["audio"],
+        input_audio_format: "g711_ulaw",   // Twilio sends μ-law 8k
+        output_audio_format: "g711_ulaw",  // Have OpenAI return μ-law 8k
+        turn_detection: { type: "server_vad" },
+        instructions:
+          "You are a friendly ENGLISH-ONLY phone assistant. " +
+          "Deliver the caller’s message, then keep replies brief (under 8 seconds)."
+      }
+    }));
+
+    // Initial prompt
+    oai.send(JSON.stringify({
+      type: "response.create",
+      response: { instructions: `Deliver this message: ${prompt}`, modalities: ["audio"] }
+    }));
+  });
+
+  // Twilio -> OpenAI
   ws.on("message", (buf) => {
     try {
       const msg = JSON.parse(buf.toString());
-      if (msg.event === "start") streamSid = msg.start?.streamSid;
-      else if (msg.event === "media" && streamSid)
+      if (msg.event === "start") {
+        streamSid = msg.start?.streamSid;
+      } else if (msg.event === "media" && streamSid && oaiOpen) {
         oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
-      else if (msg.event === "stop") { try { oai.close(); } catch {}; try { ws.close(); } catch {}; }
-    } catch (e) { console.error("Twilio msg parse error:", e); }
-  });
-
-  // OpenAI → Twilio
-  oai.addEventListener("message", (ev) => {
-    try {
-      const data = JSON.parse(ev.data);
-      if (data.type === "response.audio.delta" && data.delta && streamSid) {
-        ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: data.delta } }));
+        // (Optional) we can commit periodically; realtime server-vad works fine without explicit commit per chunk.
+      } else if (msg.event === "stop") {
+        try { oai.close(); } catch {}
+        try { ws.close(); } catch {}
       }
-    } catch { /* ignore non-JSON frames */ }
+    } catch (e) {
+      console.error("Twilio msg parse error:", e);
+    }
   });
 
-  oai.addEventListener("close", () => { try { ws.close(); } catch {} });
+  // OpenAI -> Twilio
+  oai.on("message", (data) => {
+    try {
+      const obj = JSON.parse(data.toString());
+      if (obj.type === "response.audio.delta" && obj.delta && streamSid) {
+        ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: obj.delta } }));
+      }
+    } catch {
+      // ignore non-JSON frames
+    }
+  });
+
+  oai.on("close", () => { try { ws.close(); } catch {} });
+  oai.on("error", (err) => { console.error("OpenAI WS error:", err?.message || err); try { ws.close(); } catch {} });
+
   ws.on("close", () => { try { oai.close(); } catch {} });
-}
-
-
-  oai.addEventListener("close", () => ws.close());
-  ws.on("close", () => oai.close());
 }
