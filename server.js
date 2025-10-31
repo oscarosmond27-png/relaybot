@@ -60,7 +60,35 @@ server.on("upgrade", (req, socket, head) => {
 
 // ---- Twilio <-> OpenAI bridge ----
 async function handleTwilio(ws, req) {
-  const prompt = new URL(req.url, "https://example.com").searchParams.get("prompt") || "";
+  const url = new URL(req.url, "https://example.com");
+  const prompt = url.searchParams.get("prompt") || "";
+  const loop = url.searchParams.get("loop") === "1";
+
+  // --- LOOPBACK TEST MODE ---
+  if (loop) {
+    console.log("Loopback mode enabled");
+    let sid = null;
+
+    ws.on("message", (buf) => {
+      try {
+        const msg = JSON.parse(buf.toString());
+        if (msg.event === "start") {
+          sid = msg.start?.streamSid;
+        } else if (msg.event === "media" && sid) {
+          // Send the same audio back
+          ws.send(JSON.stringify({
+            event: "media",
+            streamSid: sid,
+            media: { payload: msg.media.payload }
+          }));
+        } else if (msg.event === "stop") {
+          try { ws.close(); } catch {}
+        }
+      } catch {}
+    });
+    return; // Don't connect to OpenAI in loopback mode
+  }
+
 
   // Connect to OpenAI Realtime with ws client (Node)
   const model = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
