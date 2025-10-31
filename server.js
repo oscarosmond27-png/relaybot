@@ -16,18 +16,29 @@ app.use(express.json());
 app.get("/", (_req, res) => res.type("text/plain").send("OK"));
 app.get("/health", (_req, res) => res.type("text/plain").send("healthy"));
 
-// ---- TwiML (Twilio fetches this) ----
+// TwiML endpoint (Twilio fetches this)
 app.get("/twiml", (req, res) => {
   try {
+    // Read the two inputs from the URL:
+    //   prompt = the message you want delivered
+    //   loop=1  = test mode that simply echoes audio back (no AI)
     const prompt = req.query.prompt || "";
+    const loopFlag = req.query.loop === "1";  // <-- this detects test mode
+
+    // Build the WebSocket address Twilio will connect to
     const host = req.get("host");
-    const wsUrl = `wss://${host}/twilio?prompt=${encodeURIComponent(prompt)}`;
+    const wsUrl =
+      `wss://${host}/twilio?prompt=${encodeURIComponent(prompt)}` +
+      (loopFlag ? "&loop=1" : "");            // <-- pass test mode through
+
+    // Return the XML Twilio needs
     const twiml =
       `<?xml version="1.0" encoding="UTF-8"?>\n` +
       `<Response>\n` +
       `  <Say>Hello, I have a quick message for you.</Say>\n` +
       `  <Connect><Stream url="${wsUrl}" /></Connect>\n` +
       `</Response>`;
+
     res.set("Content-Type", "text/xml").status(200).send(twiml);
   } catch (e) {
     console.error("TwiML error:", e);
@@ -37,6 +48,7 @@ app.get("/twiml", (req, res) => {
       .send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, an error occurred.</Say></Response>`);
   }
 });
+
 
 // ---- HTTP server ----
 const server = app.listen(process.env.PORT || 10000, () => {
